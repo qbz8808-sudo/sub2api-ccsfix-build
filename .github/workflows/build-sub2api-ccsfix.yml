@@ -1,0 +1,48 @@
+name: Build Sub2API CCS Fix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout official Sub2API tag
+        uses: actions/checkout@v4
+        with:
+          repository: Wei-Shaw/sub2api
+          ref: v0.1.137
+          path: sub2api
+
+      - name: Apply CCS fix
+        run: |
+          cp apply-ccsfix.sh sub2api/apply-ccsfix.sh
+          cd sub2api
+          chmod +x apply-ccsfix.sh
+          ./apply-ccsfix.sh
+
+      - name: Build patched image
+        run: |
+          cd sub2api
+          docker build -t sub2api:0.1.137-ccsfix .
+
+      - name: Verify patched binary markers
+        run: |
+          docker run --rm --entrypoint sh sub2api:0.1.137-ccsfix -lc \
+            'strings /app/sub2api | grep -E "cc-switch/1\.0|/v1/usage\?days=30" | head -20'
+          docker run --rm --entrypoint sh sub2api:0.1.137-ccsfix -lc \
+            'if strings /app/sub2api | grep -q "{{baseUrl}}/v1/usage"; then echo "OLD_PLACEHOLDER_STILL_EXISTS"; exit 1; else echo "PLACEHOLDER_REMOVED_OK"; fi'
+
+      - name: Export image tar
+        run: |
+          docker save sub2api:0.1.137-ccsfix | gzip > sub2api-0.1.137-ccsfix.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sub2api-0.1.137-ccsfix
+          path: sub2api-0.1.137-ccsfix.tar.gz
+          if-no-files-found: error
