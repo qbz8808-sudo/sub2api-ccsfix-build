@@ -1,4 +1,4 @@
-name: Build Sub2API CCS Fix
+name: Build Sub2API CCS Fix Safe Update
 
 on:
   workflow_dispatch:
@@ -32,22 +32,24 @@ jobs:
       - name: Build patched image
         run: |
           cd sub2api
-          docker build -t sub2api:0.1.137-ccsfix .
+          docker build -t sub2api:0.1.137-ccsfix-safeupdate .
 
       - name: Verify patched binary markers
         run: |
-          docker run --rm --entrypoint sh sub2api:0.1.137-ccsfix -lc \
+          docker run --rm --entrypoint sh sub2api:0.1.137-ccsfix-safeupdate -lc \
             'strings /app/sub2api | grep -E "cc-switch/1\.0|/v1/usage\?days=30" | head -20'
-          docker run --rm --entrypoint sh sub2api:0.1.137-ccsfix -lc \
+          docker run --rm --entrypoint sh sub2api:0.1.137-ccsfix-safeupdate -lc \
             'if strings /app/sub2api | grep -q "{{baseUrl}}/v1/usage"; then echo "OLD_PLACEHOLDER_STILL_EXISTS"; exit 1; else echo "PLACEHOLDER_REMOVED_OK"; fi'
+          docker run --rm --entrypoint sh sub2api:0.1.137-ccsfix-safeupdate -lc \
+            'strings /app/sub2api | grep -E "UPDATE_UNSUPPORTED_IN_CONTAINER|dockerModeHint|Docker deployments do not support in-app updates" | head -20'
 
       - name: Export image tar
         run: |
-          docker save sub2api:0.1.137-ccsfix | gzip > sub2api-0.1.137-ccsfix.tar.gz
+          docker save sub2api:0.1.137-ccsfix-safeupdate | gzip > sub2api-0.1.137-ccsfix-safeupdate.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sub2api-0.1.137-ccsfix
-          path: sub2api-0.1.137-ccsfix.tar.gz
+          name: sub2api-0.1.137-ccsfix-safeupdate
+          path: sub2api-0.1.137-ccsfix-safeupdate.tar.gz
           if-no-files-found: error
