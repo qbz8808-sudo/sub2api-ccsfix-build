@@ -1,4 +1,4 @@
-name: Build Sub2API CCS Fix Safe Update
+name: Build Sub2API CCS Fix Safe Update V2
 
 on:
   workflow_dispatch:
@@ -6,8 +6,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
       - name: Checkout patch repo
@@ -22,19 +20,27 @@ jobs:
           ref: v0.1.137
           path: sub2api
 
-      - name: Apply CCS fix
+      - name: Apply patch
         run: |
           cp patch/apply-ccsfix.sh sub2api/apply-ccsfix.sh
           cd sub2api
           chmod +x apply-ccsfix.sh
           ./apply-ccsfix.sh
 
-      - name: Build patched image
+      - name: Build image
         run: |
           cd sub2api
-          docker build --build-arg VERSION=0.1.137 --build-arg COMMIT=ccsfix-safeupdate -t sub2api:0.1.137-ccsfix-safeupdate-v2 .
+          docker build --build-arg VERSION=0.1.137 --build-arg COMMIT=ccsfix-safeupdate-v2 -t sub2api:0.1.137-ccsfix-safeupdate-v2 .
 
-      - name: Verify patched binary markers
+      - name: Export image
+        run: |
+          docker save sub2api:0.1.137-ccsfix-safeupdate-v2 | gzip > sub2api-0.1.137-ccsfix-safeupdate-v2.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sub2api-0.1.137-ccsfix-safeupdate-v2
+          path: sub2api/sub2api-0.1.137-ccsfix-safeupdate-v2.tar.gz      - name: Verify patched binary markers
         run: |
           docker run --rm --entrypoint sh sub2api:0.1.137-ccsfix-safeupdate-v2 -lc 'strings /app/sub2api | grep -E "cc-switch/1\.0|/v1/usage\?days=30" | head -20'
           docker run --rm --entrypoint sh sub2api:0.1.137-ccsfix-safeupdate-v2 -lc 'if strings /app/sub2api | grep -q "{{baseUrl}}/v1/usage"; then echo "OLD_PLACEHOLDER_STILL_EXISTS"; exit 1; else echo "PLACEHOLDER_REMOVED_OK"; fi'
