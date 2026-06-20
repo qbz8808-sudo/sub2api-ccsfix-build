@@ -10,6 +10,11 @@ jobs:
       contents: read
 
     steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: patch
+
       - name: Checkout official Sub2API tag
         uses: actions/checkout@v4
         with:
@@ -19,7 +24,7 @@ jobs:
 
       - name: Apply CCS fix
         run: |
-          cp apply-ccsfix.sh sub2api/apply-ccsfix.sh
+          cp patch/apply-ccsfix.sh sub2api/apply-ccsfix.sh
           cd sub2api
           chmod +x apply-ccsfix.sh
           ./apply-ccsfix.sh
