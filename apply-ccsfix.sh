@@ -626,6 +626,10 @@ text = text.replace(
     ':href="releaseInfo?.html_url"',
 )
 text = text.replace(
+    "releaseInfo?.html_url && releaseInfo.html_url !== '#'",
+    "releaseInfo?.html_url && releaseInfo?.html_url !== '#'",
+)
+text = text.replace(
     "const isReleaseBuild = computed(() => buildType.value === 'release')",
     "const isReleaseBuild = computed(() => buildType.value === 'release' || buildType.value === 'docker')",
     1,
