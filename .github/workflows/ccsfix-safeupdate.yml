@@ -1,0 +1,210 @@
+name: Build CCSFix SafeUpdate Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to build, for example v0.1.139
+        required: true
+        type: string
+      simple_release:
+        description: Kept for compatibility with Sub2API web update inputs
+        required: false
+        type: boolean
+        default: true
+      image:
+        description: Target image without tag
+        required: false
+        type: string
+        default: ghcr.io/qbz8808-sudo/sub2api-ccsfix-build
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve build version
+        id: version
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          IMAGE="${{ github.event.inputs.image }}"
+          if [ -z "$TAG" ]; then
+            echo "tag is required, for example v0.1.139"
+            exit 1
+          fi
+          if [[ "$TAG" != v* ]]; then
+            echo "tag must start with v, for example v0.1.139"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          if [ -z "$IMAGE" ]; then
+            IMAGE="ghcr.io/qbz8808-sudo/sub2api-ccsfix-build"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            COMMIT=ccsfix-build-${{ steps.version.outputs.tag }}
+          tags: |
+            ${{ steps.version.outputs.image }}:latest
+            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.tag }}
+
+      - name: Deploy safely to small VPS
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.SUB2API_SSH_HOST }}
+          DEPLOY_USER: ${{ secrets.SUB2API_SSH_USER }}
+          DEPLOY_PORT: ${{ secrets.SUB2API_SSH_PORT }}
+          DEPLOY_KEY: ${{ secrets.SUB2API_SSH_PRIVATE_KEY }}
+          DEPLOY_DIR: ${{ secrets.SUB2API_DEPLOY_DIR }}
+          IMAGE: ${{ steps.version.outputs.image }}:latest
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DEPLOY_HOST}" ] || [ -z "${DEPLOY_KEY}" ]; then
+            echo "SSH deploy secrets are not configured; image was pushed, skipping server deploy."
+            exit 0
+          fi
+
+          DEPLOY_USER="${DEPLOY_USER:-root}"
+          DEPLOY_PORT="${DEPLOY_PORT:-22}"
+          DEPLOY_DIR="${DEPLOY_DIR:-/root/relay-station}"
+
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${DEPLOY_KEY}" > ~/.ssh/sub2api_deploy_key
+          chmod 600 ~/.ssh/sub2api_deploy_key
+          ssh-keyscan -p "${DEPLOY_PORT}" "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/sub2api_deploy_key -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "DEPLOY_DIR='${DEPLOY_DIR}' IMAGE='${IMAGE}' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          cd "${DEPLOY_DIR}"
+          exec 9>/tmp/sub2api-safe-update.lock
+          if ! flock -n 9; then
+            echo "Another Sub2API update is running; aborting."
+            exit 1
+          fi
+
+          ts="$(date +%Y%m%d-%H%M%S)"
+          backup="docker-compose.yml.bak-ccsfix-build-${ts}"
+          rollback_tag="sub2api-rollback:${ts}"
+
+          free_mb="$(df -Pm / | awk 'NR==2{print $4}')"
+          if [ "${free_mb}" -lt 1600 ] && [ -x /root/relay-station/safe-disk-maintenance.sh ]; then
+            /root/relay-station/safe-disk-maintenance.sh || true
+          fi
+          free_mb="$(df -Pm / | awk 'NR==2{print $4}')"
+          if [ "${free_mb}" -lt 900 ]; then
+            echo "Not enough free disk for safe update: ${free_mb} MB available."
+            df -h /
+            exit 1
+          fi
+
+          current_image_id="$(docker inspect -f '{{.Image}}' sub2api_core)"
+          docker tag "${current_image_id}" "${rollback_tag}"
+          cp docker-compose.yml "${backup}"
+
+          echo "Pulling ${IMAGE}..."
+          docker pull "${IMAGE}"
+          new_image_id="$(docker image inspect -f '{{.Id}}' "${IMAGE}")"
+          if [ "${new_image_id}" = "${current_image_id}" ]; then
+            echo "Image is already current."
+            docker rmi "${rollback_tag}" >/dev/null 2>&1 || true
+            [ -x /root/relay-station/safe-disk-maintenance.sh ] && /root/relay-station/safe-disk-maintenance.sh || true
+            df -h /
+            exit 0
+          fi
+
+          set_compose_image() {
+            TARGET_IMAGE="$1" python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          path = Path("docker-compose.yml")
+          lines = path.read_text().splitlines()
+          target = os.environ["TARGET_IMAGE"]
+
+          start = None
+          for i, line in enumerate(lines):
+              if re.match(r"^\s{2}sub2api:\s*$", line):
+                  start = i
+                  break
+          if start is None:
+              raise SystemExit("services.sub2api not found")
+
+          end = len(lines)
+          for i in range(start + 1, len(lines)):
+              if re.match(r"^\s{2}[A-Za-z0-9_.-]+:\s*$", lines[i]):
+                  end = i
+                  break
+
+          for i in range(start + 1, end):
+              if re.match(r"^\s*image:\s*", lines[i]):
+                  indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+                  lines[i] = f"{indent}image: {target}"
+                  path.write_text("\n".join(lines) + "\n")
+                  print(f"compose image set to {target}")
+                  break
+          else:
+              raise SystemExit("sub2api image line not found")
+          PY
+          }
+
+          wait_healthy() {
+            for _ in $(seq 1 60); do
+              status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' sub2api_core 2>/dev/null || true)"
+              if [ "${status}" = "healthy" ] || [ "${status}" = "running" ]; then
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+
+          set_compose_image "${IMAGE}"
+          docker compose up -d --force-recreate sub2api
+
+          if ! wait_healthy; then
+            echo "New container failed health check; rolling back."
+            cp "${backup}" docker-compose.yml
+            set_compose_image "${rollback_tag}"
+            docker compose up -d --force-recreate sub2api
+            wait_healthy || true
+            docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+            exit 1
+          fi
+
+          echo "Update succeeded."
+          docker rmi "${rollback_tag}" >/dev/null 2>&1 || true
+          docker image prune -f || true
+          [ -x /root/relay-station/safe-disk-maintenance.sh ] && /root/relay-station/safe-disk-maintenance.sh || true
+          docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+          df -h /
+          REMOTE
