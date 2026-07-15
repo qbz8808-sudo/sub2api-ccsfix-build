@@ -1,12 +1,13 @@
-name: Build CCSFix SafeUpdate Image
+name: Build Official Sub2API Candidate
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Version tag to build, for example v0.1.139
-        required: true
+        description: Official Sub2API tag, for example v0.1.152
+        required: false
         type: string
+        default: v0.1.155
       simple_release:
         description: Kept for compatibility with Sub2API web update inputs
         required: false
@@ -22,34 +23,110 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: sub2api-official-safeupdate
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - name: Checkout
+      - name: Checkout official source
         uses: actions/checkout@v4
+        with:
+          repository: Wei-Shaw/sub2api
+          ref: ${{ inputs.tag || 'v0.1.155' }}
+          fetch-depth: 1
+          fetch-tags: true
 
       - name: Resolve build version
         id: version
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          REQUESTED_IMAGE: ${{ inputs.image }}
         shell: bash
         run: |
-          TAG="${{ github.event.inputs.tag }}"
-          IMAGE="${{ github.event.inputs.image }}"
-          if [ -z "$TAG" ]; then
-            echo "tag is required, for example v0.1.139"
+          set -euo pipefail
+          TAG="${REQUESTED_TAG:-v0.1.155}"
+          IMAGE="${REQUESTED_IMAGE:-ghcr.io/${GITHUB_REPOSITORY}}"
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid official tag: ${TAG}"
             exit 1
           fi
-          if [[ "$TAG" != v* ]]; then
-            echo "tag must start with v, for example v0.1.139"
+          if [ -z "${IMAGE}" ]; then
+            IMAGE="ghcr.io/${GITHUB_REPOSITORY}"
+          fi
+          IMAGE="$(printf '%s' "${IMAGE}" | tr '[:upper:]' '[:lower:]')"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${TAG#v}" >> "${GITHUB_OUTPUT}"
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Record official source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          COMMIT="$(git rev-parse HEAD)"
+          TAG_COMMIT="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          if [ "${COMMIT}" != "${TAG_COMMIT}" ]; then
+            echo "checkout does not match official tag ${TAG}: ${COMMIT} != ${TAG_COMMIT}"
             exit 1
           fi
-          VERSION="${TAG#v}"
-          if [ -z "$IMAGE" ]; then
-            IMAGE="ghcr.io/qbz8808-sudo/sub2api-ccsfix-build"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          CANDIDATE_TAG="official-${TAG}-${COMMIT:0:12}"
+          echo "commit=${COMMIT}" >> "${GITHUB_OUTPUT}"
+          echo "candidate_tag=${CANDIDATE_TAG}" >> "${GITHUB_OUTPUT}"
+          {
+            echo '### Official Sub2API source'
+            echo '- repository: `Wei-Shaw/sub2api`'
+            echo "- tag: \`${TAG}\`"
+            printf '%s\n' "- commit: \`${COMMIT}\`"
+            printf '%s\n' "- candidate image tag: \`${CANDIDATE_TAG}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Verify Go version
+        working-directory: backend
+        shell: bash
+        run: |
+          required="$(awk '$1 == "go" { print $2; exit }' go.mod)"
+          go version | grep -q "go${required}"
+
+      - name: Backend tests
+        working-directory: backend
+        run: go test -tags=unit ./internal/service ./internal/handler/admin ./internal/server
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: pnpm run typecheck
+
+      - name: Frontend tests
+        working-directory: frontend
+        run: pnpm exec vitest run src/views/admin/__tests__/SettingsView.spec.ts
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -62,149 +139,29 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
+        id: image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           push: true
+          provenance: true
+          sbom: true
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
-            COMMIT=ccsfix-build-${{ steps.version.outputs.tag }}
+            COMMIT=${{ steps.source.outputs.commit }}
           tags: |
-            ${{ steps.version.outputs.image }}:latest
-            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.tag }}
+            ${{ steps.version.outputs.image }}:${{ steps.source.outputs.candidate_tag }}
 
-      - name: Deploy safely to small VPS
+      - name: Record candidate image
         shell: bash
         env:
-          DEPLOY_HOST: ${{ secrets.SUB2API_SSH_HOST }}
-          DEPLOY_USER: ${{ secrets.SUB2API_SSH_USER }}
-          DEPLOY_PORT: ${{ secrets.SUB2API_SSH_PORT }}
-          DEPLOY_KEY: ${{ secrets.SUB2API_SSH_PRIVATE_KEY }}
-          DEPLOY_DIR: ${{ secrets.SUB2API_DEPLOY_DIR }}
-          IMAGE: ${{ steps.version.outputs.image }}:latest
+          IMAGE: ${{ steps.version.outputs.image }}:${{ steps.source.outputs.candidate_tag }}
+          DIGEST: ${{ steps.image.outputs.digest }}
         run: |
-          set -euo pipefail
-
-          if [ -z "${DEPLOY_HOST}" ] || [ -z "${DEPLOY_KEY}" ]; then
-            echo "SSH deploy secrets are not configured; image was pushed, skipping server deploy."
-            exit 0
-          fi
-
-          DEPLOY_USER="${DEPLOY_USER:-root}"
-          DEPLOY_PORT="${DEPLOY_PORT:-22}"
-          DEPLOY_DIR="${DEPLOY_DIR:-/root/relay-station}"
-
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "${DEPLOY_KEY}" > ~/.ssh/sub2api_deploy_key
-          chmod 600 ~/.ssh/sub2api_deploy_key
-          ssh-keyscan -p "${DEPLOY_PORT}" "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
-
-          ssh -i ~/.ssh/sub2api_deploy_key -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            "DEPLOY_DIR='${DEPLOY_DIR}' IMAGE='${IMAGE}' bash -s" <<'REMOTE'
-          set -euo pipefail
-
-          cd "${DEPLOY_DIR}"
-          exec 9>/tmp/sub2api-safe-update.lock
-          if ! flock -n 9; then
-            echo "Another Sub2API update is running; aborting."
-            exit 1
-          fi
-
-          ts="$(date +%Y%m%d-%H%M%S)"
-          backup="docker-compose.yml.bak-ccsfix-build-${ts}"
-          rollback_tag="sub2api-rollback:${ts}"
-
-          free_mb="$(df -Pm / | awk 'NR==2{print $4}')"
-          if [ "${free_mb}" -lt 1600 ] && [ -x /root/relay-station/safe-disk-maintenance.sh ]; then
-            /root/relay-station/safe-disk-maintenance.sh || true
-          fi
-          free_mb="$(df -Pm / | awk 'NR==2{print $4}')"
-          if [ "${free_mb}" -lt 900 ]; then
-            echo "Not enough free disk for safe update: ${free_mb} MB available."
-            df -h /
-            exit 1
-          fi
-
-          current_image_id="$(docker inspect -f '{{.Image}}' sub2api_core)"
-          docker tag "${current_image_id}" "${rollback_tag}"
-          cp docker-compose.yml "${backup}"
-
-          echo "Pulling ${IMAGE}..."
-          docker pull "${IMAGE}"
-          new_image_id="$(docker image inspect -f '{{.Id}}' "${IMAGE}")"
-          if [ "${new_image_id}" = "${current_image_id}" ]; then
-            echo "Image is already current."
-            docker rmi "${rollback_tag}" >/dev/null 2>&1 || true
-            [ -x /root/relay-station/safe-disk-maintenance.sh ] && /root/relay-station/safe-disk-maintenance.sh || true
-            df -h /
-            exit 0
-          fi
-
-          set_compose_image() {
-            TARGET_IMAGE="$1" python3 - <<'PY'
-          from pathlib import Path
-          import os
-          import re
-
-          path = Path("docker-compose.yml")
-          lines = path.read_text().splitlines()
-          target = os.environ["TARGET_IMAGE"]
-
-          start = None
-          for i, line in enumerate(lines):
-              if re.match(r"^\s{2}sub2api:\s*$", line):
-                  start = i
-                  break
-          if start is None:
-              raise SystemExit("services.sub2api not found")
-
-          end = len(lines)
-          for i in range(start + 1, len(lines)):
-              if re.match(r"^\s{2}[A-Za-z0-9_.-]+:\s*$", lines[i]):
-                  end = i
-                  break
-
-          for i in range(start + 1, end):
-              if re.match(r"^\s*image:\s*", lines[i]):
-                  indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
-                  lines[i] = f"{indent}image: {target}"
-                  path.write_text("\n".join(lines) + "\n")
-                  print(f"compose image set to {target}")
-                  break
-          else:
-              raise SystemExit("sub2api image line not found")
-          PY
-          }
-
-          wait_healthy() {
-            for _ in $(seq 1 60); do
-              status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' sub2api_core 2>/dev/null || true)"
-              if [ "${status}" = "healthy" ] || [ "${status}" = "running" ]; then
-                return 0
-              fi
-              sleep 2
-            done
-            return 1
-          }
-
-          set_compose_image "${IMAGE}"
-          docker compose up -d --force-recreate sub2api
-
-          if ! wait_healthy; then
-            echo "New container failed health check; rolling back."
-            cp "${backup}" docker-compose.yml
-            set_compose_image "${rollback_tag}"
-            docker compose up -d --force-recreate sub2api
-            wait_healthy || true
-            docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
-            exit 1
-          fi
-
-          echo "Update succeeded."
-          docker rmi "${rollback_tag}" >/dev/null 2>&1 || true
-          docker image prune -f || true
-          [ -x /root/relay-station/safe-disk-maintenance.sh ] && /root/relay-station/safe-disk-maintenance.sh || true
-          docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
-          df -h /
-          REMOTE
+          {
+            echo '### Candidate image'
+            printf '%s\n' "- image: \`${IMAGE}\`"
+            printf '%s\n' "- digest: \`${DIGEST}\`"
+            echo '- automatic deployment: disabled'
+          } >> "${GITHUB_STEP_SUMMARY}"
