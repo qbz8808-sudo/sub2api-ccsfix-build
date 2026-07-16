@@ -242,6 +242,7 @@ func isOpenAIRequestBodyTooLargeError(statusCode int, upstreamMsg string, upstre
 }
 
 func newOpenAIUpstreamFailoverError(
+	account *Account,
 	statusCode int,
 	responseHeaders http.Header,
 	responseBody []byte,
@@ -252,7 +253,7 @@ func newOpenAIUpstreamFailoverError(
 		StatusCode:             statusCode,
 		ResponseBody:           responseBody,
 		ResponseHeaders:        responseHeaders.Clone(),
-		RetryableOnSameAccount: retryableOnSameAccount,
+		RetryableOnSameAccount: shouldRetryOpenAIOnSameAccount(account, statusCode, retryableOnSameAccount),
 	}
 	if isOpenAIRequestBodyTooLargeError(statusCode, upstreamMsg, responseBody) {
 		failoverErr.RetryableOnSameAccount = false
@@ -384,6 +385,7 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		})
 		s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, body, requestedModel...)
 		return nil, newOpenAIUpstreamFailoverError(
+			account,
 			resp.StatusCode,
 			resp.Header,
 			body,
@@ -470,7 +472,7 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		return nil, &UpstreamFailoverError{
 			StatusCode:             resp.StatusCode,
 			ResponseBody:           body,
-			RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+			RetryableOnSameAccount: shouldRetryOpenAIOnSameAccount(account, resp.StatusCode, account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode)),
 		}
 	}
 
@@ -640,7 +642,7 @@ func (s *OpenAIGatewayService) handleCompatErrorResponse(
 		return nil, &UpstreamFailoverError{
 			StatusCode:             resp.StatusCode,
 			ResponseBody:           body,
-			RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+			RetryableOnSameAccount: shouldRetryOpenAIOnSameAccount(account, resp.StatusCode, account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode)),
 		}
 	}
 

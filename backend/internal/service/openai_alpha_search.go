@@ -100,7 +100,7 @@ func (s *OpenAIGatewayService) ForwardAlphaSearch(ctx context.Context, c *gin.Co
 			return nil, &UpstreamFailoverError{
 				StatusCode:             resp.StatusCode,
 				ResponseBody:           respBody,
-				RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+				RetryableOnSameAccount: shouldRetryOpenAIOnSameAccount(account, resp.StatusCode, account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode)),
 			}
 		}
 	}
@@ -174,7 +174,7 @@ func (s *OpenAIGatewayService) forwardAlphaSearchViaResponsesWebSearch(
 			return nil, &UpstreamFailoverError{
 				StatusCode:             resp.StatusCode,
 				ResponseBody:           respBody,
-				RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+				RetryableOnSameAccount: shouldRetryOpenAIOnSameAccount(account, resp.StatusCode, account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode)),
 			}
 		}
 	}

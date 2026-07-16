@@ -409,8 +409,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		if statusCode == http.StatusTooManyRequests {
 			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()))
 			return &UpstreamFailoverError{
-				StatusCode:      http.StatusTooManyRequests,
-				ResponseHeaders: cloneHeader(handshakeHeaders),
+				StatusCode:             http.StatusTooManyRequests,
+				ResponseHeaders:        cloneHeader(handshakeHeaders),
+				RetryableOnSameAccount: shouldRetryOpenAIOnSameAccount(account, http.StatusTooManyRequests, false),
 			}
 		}
 		return s.mapOpenAIWSPassthroughDialError(err, statusCode, handshakeHeaders)
@@ -630,9 +631,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					truncateOpenAIWSLogValue(errMsgRaw, openAIWSLogValueMaxLen),
 				)
 				return &UpstreamFailoverError{
-					StatusCode:      http.StatusTooManyRequests,
-					ResponseBody:    append([]byte(nil), payload...),
-					ResponseHeaders: cloneHeader(handshakeHeaders),
+					StatusCode:             http.StatusTooManyRequests,
+					ResponseBody:           append([]byte(nil), payload...),
+					ResponseHeaders:        cloneHeader(handshakeHeaders),
+					RetryableOnSameAccount: shouldRetryOpenAIOnSameAccount(account, http.StatusTooManyRequests, false),
 				}
 			},
 			OnTrace: func(event openaiwsv2.RelayTraceEvent) {

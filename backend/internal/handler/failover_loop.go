@@ -42,6 +42,27 @@ const (
 	singleAccountBackoffDelay = 2 * time.Second
 )
 
+func newSameAccountRetrySelection(selection *service.AccountSelectionResult) *service.AccountSelectionResult {
+	if selection == nil || selection.Account == nil {
+		return nil
+	}
+
+	waitPlan := &service.AccountWaitPlan{
+		AccountID:      selection.Account.ID,
+		MaxConcurrency: selection.Account.Concurrency,
+		Timeout:        sameAccountRetryDelay,
+		MaxWaiting:     1,
+	}
+	if selection.WaitPlan != nil {
+		copied := *selection.WaitPlan
+		waitPlan = &copied
+	}
+	return &service.AccountSelectionResult{
+		Account:  selection.Account,
+		WaitPlan: waitPlan,
+	}
+}
+
 // FailoverState 跨循环迭代共享的 failover 状态
 type FailoverState struct {
 	SwitchCount           int

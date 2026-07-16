@@ -73,6 +73,41 @@ func TestNewFailoverState(t *testing.T) {
 	})
 }
 
+func TestNewSameAccountRetrySelection(t *testing.T) {
+	account := &service.Account{ID: 42, Concurrency: 3}
+	released := false
+	original := &service.AccountSelectionResult{
+		Account:     account,
+		Acquired:    true,
+		ReleaseFunc: func() { released = true },
+	}
+
+	retry := newSameAccountRetrySelection(original)
+
+	require.Same(t, account, retry.Account)
+	require.False(t, retry.Acquired)
+	require.Nil(t, retry.ReleaseFunc)
+	require.Equal(t, int64(42), retry.WaitPlan.AccountID)
+	require.Equal(t, 3, retry.WaitPlan.MaxConcurrency)
+	require.Equal(t, sameAccountRetryDelay, retry.WaitPlan.Timeout)
+	require.Equal(t, 1, retry.WaitPlan.MaxWaiting)
+	require.False(t, released)
+	require.True(t, original.Acquired, "original selection must remain unchanged")
+
+	original.WaitPlan = &service.AccountWaitPlan{
+		AccountID:      42,
+		MaxConcurrency: 5,
+		Timeout:        2 * time.Second,
+		MaxWaiting:     7,
+	}
+	retry = newSameAccountRetrySelection(original)
+	require.Equal(t, original.WaitPlan, retry.WaitPlan)
+	require.NotSame(t, original.WaitPlan, retry.WaitPlan)
+
+	require.Nil(t, newSameAccountRetrySelection(nil))
+	require.Nil(t, newSameAccountRetrySelection(&service.AccountSelectionResult{}))
+}
+
 // ---------------------------------------------------------------------------
 // sleepWithContext 测试
 // ---------------------------------------------------------------------------
