@@ -33,6 +33,30 @@ type updateServiceGitHubClientStub struct {
 	recentErr      error
 }
 
+type updateAgentStub struct {
+	info         *updateAgentInfo
+	status       *ManagedUpdateStatus
+	checkErr     error
+	statusErr    error
+	triggerErr   error
+	checkForces  []bool
+	triggerCalls int
+}
+
+func (s *updateAgentStub) Check(_ context.Context, force bool) (*updateAgentInfo, error) {
+	s.checkForces = append(s.checkForces, force)
+	return s.info, s.checkErr
+}
+
+func (s *updateAgentStub) Trigger(context.Context) error {
+	s.triggerCalls++
+	return s.triggerErr
+}
+
+func (s *updateAgentStub) Status(context.Context) (*ManagedUpdateStatus, error) {
+	return s.status, s.statusErr
+}
+
 func (s *updateServiceGitHubClientStub) FetchLatestRelease(context.Context, string) (*GitHubRelease, error) {
 	return s.release, nil
 }
@@ -67,6 +91,100 @@ func TestUpdateServicePerformUpdateNoUpdateReturnsSentinel(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrNoUpdateAvailable))
 	require.ErrorIs(t, err, ErrNoUpdateAvailable)
+}
+
+func TestUpdateServiceCustomBuildSuffixMatchesOfficialBaseVersion(t *testing.T) {
+	svc := NewUpdateService(
+		&updateServiceCacheStub{},
+		&updateServiceGitHubClientStub{release: &GitHubRelease{TagName: "v0.1.158"}},
+		"0.1.158-429",
+		"release",
+	)
+
+	info, err := svc.CheckUpdate(context.Background(), true)
+
+	require.NoError(t, err)
+	require.False(t, info.HasUpdate)
+	require.Equal(t, "0.1.158-429", info.CurrentVersion)
+	require.Equal(t, "0.1.158", info.LatestVersion)
+}
+
+func TestCompareVersionsTreatsCustomSuffixAsBuildMetadata(t *testing.T) {
+	require.Equal(t, 0, compareVersions("0.1.158-429", "0.1.158"))
+	require.Equal(t, 0, compareVersions("v0.1.158-custom.2", "0.1.158"))
+	require.Equal(t, -1, compareVersions("0.1.158-429", "0.1.159"))
+	require.Equal(t, 1, compareVersions("0.1.159-429", "0.1.158"))
+}
+
+func TestUpdateServiceManagedAvailabilityUsesImageDigest(t *testing.T) {
+	agent := &updateAgentStub{info: &updateAgentInfo{
+		HasUpdate:     true,
+		LatestVersion: "0.1.158-429.2",
+	}}
+	svc := NewUpdateService(
+		&updateServiceCacheStub{},
+		&updateServiceGitHubClientStub{release: &GitHubRelease{TagName: "v0.1.158"}},
+		"0.1.158-429",
+		"release",
+	)
+	svc.updateAgent = agent
+
+	info, err := svc.CheckUpdate(context.Background(), true)
+
+	require.NoError(t, err)
+	require.True(t, info.ManagedUpdate)
+	require.True(t, info.HasUpdate)
+	require.Equal(t, "0.1.158-429.2", info.LatestVersion)
+	require.Equal(t, []bool{true}, agent.checkForces)
+}
+
+func TestUpdateServiceManagedUpdateTriggersAgent(t *testing.T) {
+	agent := &updateAgentStub{info: &updateAgentInfo{HasUpdate: true}}
+	svc := NewUpdateService(
+		&updateServiceCacheStub{},
+		&updateServiceGitHubClientStub{release: &GitHubRelease{TagName: "v0.1.158"}},
+		"0.1.158-429",
+		"release",
+	)
+	svc.updateAgent = agent
+
+	err := svc.PerformUpdate(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, []bool{true}, agent.checkForces)
+	require.Equal(t, 1, agent.triggerCalls)
+}
+
+func TestUpdateServiceManagedUpdateSkipsTriggerWhenImageMatches(t *testing.T) {
+	agent := &updateAgentStub{info: &updateAgentInfo{HasUpdate: false}}
+	svc := NewUpdateService(
+		&updateServiceCacheStub{},
+		&updateServiceGitHubClientStub{release: &GitHubRelease{TagName: "v0.1.158"}},
+		"0.1.158-429",
+		"release",
+	)
+	svc.updateAgent = agent
+
+	err := svc.PerformUpdate(context.Background())
+
+	require.ErrorIs(t, err, ErrNoUpdateAvailable)
+	require.Zero(t, agent.triggerCalls)
+}
+
+func TestUpdateServiceManagedUpdaterDisablesInPlaceRollback(t *testing.T) {
+	svc := NewUpdateService(
+		&updateServiceCacheStub{},
+		&updateServiceGitHubClientStub{},
+		"0.1.158-429",
+		"release",
+	)
+	svc.updateAgent = &updateAgentStub{}
+
+	versions, err := svc.ListRollbackVersions(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, versions)
+	require.ErrorIs(t, svc.Rollback(), ErrManagedRollbackDisabled)
+	require.ErrorIs(t, svc.RollbackToVersion(context.Background(), "0.1.157"), ErrManagedRollbackDisabled)
 }
 
 func newRollbackTestService(current string, releases []*GitHubRelease) *UpdateService {

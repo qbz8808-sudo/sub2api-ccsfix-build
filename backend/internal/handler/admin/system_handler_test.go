@@ -30,6 +30,17 @@ type systemHandlerUpdateServiceStub struct {
 	rollbackVersions     []service.RollbackVersion
 	rollbackVersionsErr  error
 	rollbackVersionsCall int
+	managedUpdates       bool
+	managedUpdateStatus  *service.ManagedUpdateStatus
+	managedStatusErr     error
+}
+
+func (s *systemHandlerUpdateServiceStub) ManagedUpdatesEnabled() bool {
+	return s.managedUpdates
+}
+
+func (s *systemHandlerUpdateServiceStub) ManagedUpdateStatus(context.Context) (*service.ManagedUpdateStatus, error) {
+	return s.managedUpdateStatus, s.managedStatusErr
 }
 
 func (s *systemHandlerUpdateServiceStub) CheckUpdate(_ context.Context, force bool) (*service.UpdateInfo, error) {
@@ -67,6 +78,8 @@ type systemUpdateResponseEnvelope struct {
 		CurrentVersion  string `json:"current_version"`
 		LatestVersion   string `json:"latest_version"`
 		OperationID     string `json:"operation_id"`
+		NeedRestart     bool   `json:"need_restart"`
+		Automatic       bool   `json:"automatic"`
 	} `json:"data"`
 }
 
@@ -91,6 +104,7 @@ func newSystemHandlerTestRouter(t *testing.T, updateSvc *systemHandlerUpdateServ
 
 	router := gin.New()
 	router.POST("/api/v1/admin/system/update", handler.PerformUpdate)
+	router.GET("/api/v1/admin/system/update-status", handler.GetUpdateStatus)
 	router.POST("/api/v1/admin/system/rollback", handler.Rollback)
 	router.GET("/api/v1/admin/system/rollback-versions", handler.GetRollbackVersions)
 	return router
@@ -163,6 +177,47 @@ func TestSystemHandlerPerformUpdateFailureStillReturnsInternalError(t *testing.T
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.Equal(t, http.StatusInternalServerError, body.Code)
 	require.Equal(t, "internal error", body.Message)
+}
+
+func TestSystemHandlerPerformManagedUpdateReturnsAutomaticRestart(t *testing.T) {
+	updateSvc := &systemHandlerUpdateServiceStub{managedUpdates: true}
+	repo := newMemoryIdempotencyRepoStub()
+	router := newSystemHandlerTestRouter(t, updateSvc, repo)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/system/update", nil)
+	req.Header.Set("Idempotency-Key", "managed-update")
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, 1, updateSvc.performCall)
+	requireSystemLockStatus(t, repo, service.IdempotencyStatusSucceeded)
+
+	var body systemUpdateResponseEnvelope
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.True(t, body.Data.Automatic)
+	require.False(t, body.Data.NeedRestart)
+	require.Equal(t, "Update started. The service will restart automatically.", body.Data.Message)
+}
+
+func TestSystemHandlerGetManagedUpdateStatus(t *testing.T) {
+	updateSvc := &systemHandlerUpdateServiceStub{
+		managedUpdateStatus: &service.ManagedUpdateStatus{State: "running", Message: "updating"},
+	}
+	repo := newMemoryIdempotencyRepoStub()
+	router := newSystemHandlerTestRouter(t, updateSvc, repo)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/system/update-status", nil)
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var body struct {
+		Data service.ManagedUpdateStatus `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, "running", body.Data.State)
+	require.Equal(t, "updating", body.Data.Message)
 }
 
 func TestSystemHandlerRollbackWithoutBodyUsesLegacyBackup(t *testing.T) {

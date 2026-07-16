@@ -25,6 +25,7 @@ import (
 var (
 	ErrNoUpdateAvailable         = infraerrors.Conflict("ALREADY_UP_TO_DATE", "no update available; current version is latest")
 	ErrRollbackVersionNotAllowed = infraerrors.BadRequest("ROLLBACK_VERSION_NOT_ALLOWED", "version is not in the allowed rollback list")
+	ErrManagedRollbackDisabled   = infraerrors.Conflict("MANAGED_ROLLBACK_DISABLED", "rollback is handled by the managed updater")
 )
 
 const (
@@ -63,6 +64,7 @@ type GitHubReleaseClient interface {
 type UpdateService struct {
 	cache          UpdateCache
 	githubClient   GitHubReleaseClient
+	updateAgent    updateAgent
 	currentVersion string
 	buildType      string // "source" for manual builds, "release" for CI builds
 }
@@ -72,6 +74,7 @@ func NewUpdateService(cache UpdateCache, githubClient GitHubReleaseClient, versi
 	return &UpdateService{
 		cache:          cache,
 		githubClient:   githubClient,
+		updateAgent:    newUpdateAgentFromEnv(),
 		currentVersion: version,
 		buildType:      buildType,
 	}
@@ -86,6 +89,7 @@ type UpdateInfo struct {
 	Cached         bool         `json:"cached"`
 	Warning        string       `json:"warning,omitempty"`
 	BuildType      string       `json:"build_type"` // "source" or "release"
+	ManagedUpdate  bool         `json:"managed_update"`
 }
 
 // ReleaseInfo contains GitHub release details
@@ -134,7 +138,7 @@ func (s *UpdateService) CheckUpdate(ctx context.Context, force bool) (*UpdateInf
 	// Try cache first
 	if !force {
 		if cached, err := s.getFromCache(ctx); err == nil && cached != nil {
-			return cached, nil
+			return s.withManagedUpdateInfo(ctx, cached, false), nil
 		}
 	}
 
@@ -144,25 +148,40 @@ func (s *UpdateService) CheckUpdate(ctx context.Context, force bool) (*UpdateInf
 		// Return cached on error
 		if cached, cacheErr := s.getFromCache(ctx); cacheErr == nil && cached != nil {
 			cached.Warning = "Using cached data: " + err.Error()
-			return cached, nil
+			return s.withManagedUpdateInfo(ctx, cached, force), nil
 		}
-		return &UpdateInfo{
+		info := &UpdateInfo{
 			CurrentVersion: s.currentVersion,
 			LatestVersion:  s.currentVersion,
 			HasUpdate:      false,
 			Warning:        err.Error(),
 			BuildType:      s.buildType,
-		}, nil
+		}
+		return s.withManagedUpdateInfo(ctx, info, force), nil
 	}
 
 	// Cache result
 	s.saveToCache(ctx, info)
-	return info, nil
+	return s.withManagedUpdateInfo(ctx, info, force), nil
 }
 
 // PerformUpdate downloads and applies the update
 // Uses atomic file replacement pattern for safe in-place updates
 func (s *UpdateService) PerformUpdate(ctx context.Context) error {
+	if s.updateAgent != nil {
+		agentInfo, err := s.updateAgent.Check(ctx, true)
+		if err != nil {
+			return fmt.Errorf("managed update check failed: %w", err)
+		}
+		if !agentInfo.HasUpdate {
+			return ErrNoUpdateAvailable
+		}
+		if err := s.updateAgent.Trigger(ctx); err != nil {
+			return fmt.Errorf("managed update trigger failed: %w", err)
+		}
+		return nil
+	}
+
 	info, err := s.CheckUpdate(ctx, true)
 	if err != nil {
 		return err
@@ -173,6 +192,12 @@ func (s *UpdateService) PerformUpdate(ctx context.Context) error {
 	}
 
 	return s.applyReleaseAssets(ctx, info.ReleaseInfo.Assets)
+}
+
+// ManagedUpdatesEnabled reports whether this process delegates updates to the
+// host-side image updater instead of replacing its own executable.
+func (s *UpdateService) ManagedUpdatesEnabled() bool {
+	return s.updateAgent != nil
 }
 
 // applyReleaseAssets downloads the platform archive from the given release assets,
@@ -281,6 +306,9 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 
 // Rollback restores the previous version
 func (s *UpdateService) Rollback() error {
+	if s.updateAgent != nil {
+		return ErrManagedRollbackDisabled
+	}
 	exePath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to get executable path: %w", err)
@@ -307,6 +335,9 @@ func (s *UpdateService) Rollback() error {
 // strictly older than the current version (the current version itself is excluded),
 // newest first. Draft and prerelease entries are skipped.
 func (s *UpdateService) ListRollbackVersions(ctx context.Context) ([]RollbackVersion, error) {
+	if s.updateAgent != nil {
+		return []RollbackVersion{}, nil
+	}
 	releases, err := s.fetchRollbackCandidates(ctx)
 	if err != nil {
 		return nil, err
@@ -327,6 +358,9 @@ func (s *UpdateService) ListRollbackVersions(ctx context.Context) ([]RollbackVer
 // The target must be one of the versions returned by ListRollbackVersions;
 // anything else (including the current version) is rejected.
 func (s *UpdateService) RollbackToVersion(ctx context.Context, version string) error {
+	if s.updateAgent != nil {
+		return ErrManagedRollbackDisabled
+	}
 	target := strings.TrimPrefix(strings.TrimSpace(version), "v")
 	if target == "" {
 		return ErrRollbackVersionNotAllowed
@@ -658,7 +692,15 @@ func parseVersion(v string) [3]int {
 	parts := strings.Split(v, ".")
 	result := [3]int{0, 0, 0}
 	for i := 0; i < len(parts) && i < 3; i++ {
-		if parsed, err := strconv.Atoi(parts[i]); err == nil {
+		part := parts[i]
+		end := 0
+		for end < len(part) && part[end] >= '0' && part[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			continue
+		}
+		if parsed, err := strconv.Atoi(part[:end]); err == nil {
 			result[i] = parsed
 		}
 	}

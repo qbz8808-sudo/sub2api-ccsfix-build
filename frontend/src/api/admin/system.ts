@@ -19,6 +19,7 @@ export interface VersionInfo {
   cached: boolean
   warning?: string
   build_type: string // "source" for manual builds, "release" for CI builds
+  managed_update?: boolean
 }
 
 /**
@@ -43,6 +44,15 @@ export async function checkUpdates(force = false): Promise<VersionInfo> {
 export interface UpdateResult {
   message: string
   need_restart: boolean
+  automatic?: boolean
+  already_up_to_date?: boolean
+}
+
+export interface ManagedUpdateStatus {
+  state: 'disabled' | 'idle' | 'running' | 'succeeded' | 'failed'
+  message?: string
+  started_at?: string
+  finished_at?: string
 }
 
 export interface RollbackVersionInfo {
@@ -70,6 +80,11 @@ export async function performUpdate(): Promise<UpdateResult> {
   return data
 }
 
+export async function getUpdateStatus(): Promise<ManagedUpdateStatus> {
+  const { data } = await apiClient.get<ManagedUpdateStatus>('/admin/system/update-status')
+  return data
+}
+
 /**
  * Rollback to a previous version
  * @param version - Target version (e.g. "0.1.146"); omit to restore the local backup binary
@@ -94,6 +109,7 @@ export const systemAPI = {
   getVersion,
   checkUpdates,
   performUpdate,
+  getUpdateStatus,
   getRollbackVersions,
   rollback,
   restartService

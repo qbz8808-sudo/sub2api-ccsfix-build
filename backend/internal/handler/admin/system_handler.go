@@ -30,6 +30,14 @@ type systemUpdateService interface {
 	RollbackToVersion(ctx context.Context, version string) error
 }
 
+type managedSystemUpdateService interface {
+	ManagedUpdatesEnabled() bool
+}
+
+type managedSystemUpdateStatusService interface {
+	ManagedUpdateStatus(ctx context.Context) (*service.ManagedUpdateStatus, error)
+}
+
 // NewSystemHandler creates a new SystemHandler
 func NewSystemHandler(updateSvc systemUpdateService, lockSvc *service.SystemOperationLockService) *SystemHandler {
 	return &SystemHandler{
@@ -95,13 +103,39 @@ func (h *SystemHandler) PerformUpdate(c *gin.Context) {
 			return nil, err
 		}
 		succeeded = true
+		automatic := false
+		if managed, ok := h.updateSvc.(managedSystemUpdateService); ok {
+			automatic = managed.ManagedUpdatesEnabled()
+		}
+		message := "Update completed. Please restart the service."
+		if automatic {
+			message = "Update started. The service will restart automatically."
+		}
 
 		return gin.H{
-			"message":      "Update completed. Please restart the service.",
-			"need_restart": true,
+			"message":      message,
+			"need_restart": !automatic,
+			"automatic":    automatic,
 			"operation_id": lock.OperationID(),
 		}, nil
 	})
+}
+
+// GetUpdateStatus returns the host-side managed updater state.
+// GET /api/v1/admin/system/update-status
+func (h *SystemHandler) GetUpdateStatus(c *gin.Context) {
+	managed, ok := h.updateSvc.(managedSystemUpdateStatusService)
+	if !ok {
+		response.Success(c, &service.ManagedUpdateStatus{State: "disabled"})
+		return
+	}
+
+	status, err := managed.ManagedUpdateStatus(c.Request.Context())
+	if err != nil {
+		response.Error(c, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	response.Success(c, status)
 }
 
 // GetRollbackVersions lists versions available for rollback

@@ -375,7 +375,10 @@
                 </a>
 
                 <!-- Version rollback entry -->
-                <div class="border-t border-gray-100 pt-2 dark:border-dark-700">
+                <div
+                  v-if="!managedUpdate"
+                  class="border-t border-gray-100 pt-2 dark:border-dark-700"
+                >
                   <button
                     @click="toggleRollbackPanel"
                     class="group flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-xs text-gray-400 transition-colors hover:bg-gray-50 hover:text-gray-600 dark:text-dark-500 dark:hover:bg-dark-700/50 dark:hover:text-dark-300"
@@ -643,6 +646,7 @@ import { useI18n } from 'vue-i18n'
 import { useAuthStore, useAppStore } from '@/stores'
 import {
   performUpdate,
+  getUpdateStatus,
   restartService,
   getRollbackVersions,
   rollback as rollbackAPI,
@@ -674,6 +678,7 @@ const loading = computed(() => appStore.versionLoading)
 const currentVersion = computed(() => appStore.currentVersion || props.version || '')
 const latestVersion = computed(() => appStore.latestVersion)
 const hasUpdate = computed(() => appStore.hasUpdate)
+const managedUpdate = computed(() => appStore.managedUpdate)
 const releaseInfo = computed(() => appStore.releaseInfo)
 const buildType = computed(() => appStore.buildType)
 
@@ -760,6 +765,19 @@ async function handleUpdate() {
 
   try {
     const result = await performUpdate()
+
+    if (result.already_up_to_date) {
+      await appStore.fetchVersion(true)
+      updateSuccess.value = true
+      needRestart.value = false
+      return
+    }
+
+    if (result.automatic) {
+      await waitForManagedUpdate()
+      return
+    }
+
     successKind.value = 'update'
     updateSuccess.value = true
     needRestart.value = result.need_restart
@@ -771,6 +789,34 @@ async function handleUpdate() {
   } finally {
     updating.value = false
   }
+}
+
+async function waitForManagedUpdate() {
+  const deadline = Date.now() + 5 * 60 * 1000
+  await new Promise((resolve) => setTimeout(resolve, 2000))
+
+  while (Date.now() < deadline) {
+    let status
+    try {
+      status = await getUpdateStatus()
+    } catch {
+      // The application is temporarily unreachable while its container is replaced.
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      continue
+    }
+
+    if (status.state === 'failed') {
+      throw new Error(status.message || t('version.updateFailed'))
+    }
+    if (status.state === 'succeeded') {
+      window.location.reload()
+      return
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+  }
+
+  throw new Error(t('version.updateFailed'))
 }
 
 function resetRollbackState() {
